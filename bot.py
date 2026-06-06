@@ -1,18 +1,19 @@
 import os
 import asyncio
 import aiohttp
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 import calendar
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Bot, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-# === НАСТРОЙКИ ===
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID", "769342417")
 KASPI_TOKEN = os.environ.get("KASPI_TOKEN")
 TIMEZONE = pytz.timezone("Asia/Almaty")
+
+# Правильный URL Kaspi API
 KASPI_API_URL = "https://kaspi.kz/shop/api/v2"
 
 KEYBOARD = ReplyKeyboardMarkup([
@@ -21,120 +22,106 @@ KEYBOARD = ReplyKeyboardMarkup([
 ], resize_keyboard=True)
 
 
-async def get_orders(start_dt, end_dt):
-    start_ts = int(start_dt.timestamp()) * 1000
-    end_ts = int(end_dt.timestamp()) * 1000
-    headers = {"Content-Type": "application/json", "X-Auth-Token": KASPI_TOKEN}
-    params = {
-        "page[number]": 0, "page[size]": 100,
-        "filter[orders][creationDate][$ge]": start_ts,
-        "filter[orders][creationDate][$le]": end_ts,
-        "filter[orders][state]": "APPROVED",
-        "include[orders]": "deliveryAddress",
+async def get_orders_by_status(statuses, start_dt, end_dt):
+    """Получаем заказы по статусу и дате"""
+    headers = {
+        "Content-Type": "application/json",
+        "X-Auth-Token": KASPI_TOKEN,
     }
+
     all_orders = []
+
     async with aiohttp.ClientSession() as session:
-        page = 0
-        while True:
-            params["page[number]"] = page
-            async with session.get(f"{KASPI_API_URL}/orders/", headers=headers, params=params) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    raise Exception(f"Kaspi API ошибка {resp.status}: {text}")
-                data = await resp.json()
-                orders = data.get("data", [])
-                all_orders.extend(orders)
-                total = data.get("meta", {}).get("total", 0)
-                page_size = data.get("meta", {}).get("pageSize", 100)
-                if (page + 1) * page_size >= total:
-                    break
-                page += 1
+        for status in statuses:
+            page = 0
+            while True:
+                params = {
+                    "page[number]": page,
+                    "page[size]": 100,
+                    "filter[orders][state]": status,
+                    "filter[orders][creationDate][$ge]": int(start_dt.timestamp()) * 1000,
+                    "filter[orders][creationDate][$le]": int(end_dt.timestamp()) * 1000,
+                }
+                async with session.get(
+                    f"{KASPI_API_URL}/orders/",
+                    headers=headers,
+                    params=params
+                ) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise Exception(f"Kaspi API ошибка {resp.status}: {text[:200]}")
+                    data = await resp.json()
+                    orders = data.get("data", [])
+                    all_orders.extend(orders)
+                    total = data.get("meta", {}).get("total", 0)
+                    page_size = data.get("meta", {}).get("pageSize", 100)
+                    if (page + 1) * page_size >= total:
+                        break
+                    page += 1
+
     return all_orders
 
 
-def analyze_orders(orders):
-    stats = {"total": len(orders), "my_delivery": 0, "express": 0, "zamler": 0, "other": 0, "total_sum": 0}
+def get_delivery_type(order):
+    # Замлер и Kaspi доставка = одно и то же
+    attrs = order.get("attributes", {})
+    delivery_mode = attrs.get("deliveryMode", "")
+    courier = attrs.get("courier", {}) or {}
+    courier_name = courier.get("name", "").lower() if courier else ""
+
+    if delivery_mode == "DELIVERY_EXPRESS":
+        return "express"
+    elif delivery_mode in ("DELIVERY_LOCAL", "DELIVERY"):
+        return "my_delivery"
+    else:
+        return "kaspi"  # Замлер / Kaspi доставка
+
+
+def analyze(orders):
+    stats = {
+        "total": len(orders),
+        "express": 0,
+        "my_delivery": 0,
+        "kaspi": 0,
+        "total_sum": 0,
+    }
     for order in orders:
         attrs = order.get("attributes", {})
-        delivery_mode = attrs.get("deliveryMode", "")
-        courier = attrs.get("courier", {}) or {}
-        courier_name = courier.get("name", "").lower() if courier else ""
         stats["total_sum"] += attrs.get("totalPrice", 0)
-        if "zamler" in courier_name or "замлер" in courier_name:
-            stats["zamler"] += 1
-        elif delivery_mode == "DELIVERY_EXPRESS":
-            stats["express"] += 1
-        elif delivery_mode in ("DELIVERY_LOCAL", "DELIVERY"):
-            stats["my_delivery"] += 1
-        else:
-            stats["other"] += 1
+        dtype = get_delivery_type(order)
+        stats[dtype] = stats.get(dtype, 0) + 1
     return stats
 
 
-def format_daily(stats):
-    today_str = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
-    return f"""📊 *Отчёт за {today_str}*
-
-━━━━━━━━━━━━━━━━━
-📦 Всего заказов: *{stats['total']}*
-💰 Сумма: *{stats['total_sum']:,.0f} ₸*
-━━━━━━━━━━━━━━━━━
-
-🚚 *Моя доставка:* {stats['my_delivery']} зак.
-⚡ *Экспресс:* {stats['express']} зак.
-🛵 *Замлер:* {stats['zamler']} зак.
-📦 *Прочее:* {stats['other']} зак."""
-
-
-def format_weekly(stats, week_start, week_end):
-    s = week_start.strftime("%d.%m")
-    e = week_end.strftime("%d.%m.%Y")
-    avg = stats['total_sum'] / 7 if stats['total'] > 0 else 0
-    avg_order = stats['total_sum'] / stats['total'] if stats['total'] > 0 else 0
-    return f"""📅 *Неделя {s} — {e}*
-
-━━━━━━━━━━━━━━━━━
-📦 Всего заказов: *{stats['total']}*
-💰 Выручка: *{stats['total_sum']:,.0f} ₸*
-📈 В среднем/день: *{avg:,.0f} ₸*
-🧾 Средний чек: *{avg_order:,.0f} ₸*
-━━━━━━━━━━━━━━━━━
-
-🚚 *Моя доставка:* {stats['my_delivery']} зак.
-⚡ *Экспресс:* {stats['express']} зак.
-🛵 *Замлер:* {stats['zamler']} зак.
-📦 *Прочее:* {stats['other']} зак."""
-
-
-def format_monthly(stats, month_name, year):
-    days = stats.get('days', 30)
-    avg = stats['total_sum'] / days if stats['total'] > 0 else 0
-    avg_order = stats['total_sum'] / stats['total'] if stats['total'] > 0 else 0
-    return f"""🗓 *{month_name} {year}*
-
-━━━━━━━━━━━━━━━━━
-📦 Всего заказов: *{stats['total']}*
-💰 Выручка: *{stats['total_sum']:,.0f} ₸*
-📈 В среднем/день: *{avg:,.0f} ₸*
-🧾 Средний чек: *{avg_order:,.0f} ₸*
-━━━━━━━━━━━━━━━━━
-
-🚚 *Моя доставка:* {stats['my_delivery']} зак.
-⚡ *Экспресс:* {stats['express']} зак.
-🛵 *Замлер:* {stats['zamler']} зак.
-📦 *Прочее:* {stats['other']} зак."""
-
-
-async def get_today_range():
-    now = datetime.now(TIMEZONE)
+def day_range(dt=None):
+    now = dt or datetime.now(TIMEZONE)
     start = TIMEZONE.localize(datetime(now.year, now.month, now.day, 0, 0, 0))
     end = TIMEZONE.localize(datetime(now.year, now.month, now.day, 23, 59, 59))
     return start, end
 
 
+def format_report(stats, title, period_str):
+    avg_order = stats['total_sum'] / stats['total'] if stats['total'] > 0 else 0
+    return f"""{title} *{period_str}*
+
+━━━━━━━━━━━━━━━━━
+📦 Передано на доставку: *{stats['total']} шт.*
+💰 Сумма заказов: *{stats['total_sum']:,.0f} ₸*
+🧾 Средний чек: *{avg_order:,.0f} ₸*
+━━━━━━━━━━━━━━━━━
+
+⚡ *Экспресс:* {stats['express']} шт.
+🚚 *Моя доставка:* {stats['my_delivery']} шт.
+📦 *Kaspi/Замлер:* {stats['kaspi']} шт."""
+
+
+# Статусы заказов переданных на доставку
+DELIVERY_STATUSES = ["PICKUP_WAITING", "DELIVERING", "COMPLETED"]
+
+
 async def cmd_start(update, context):
     await update.message.reply_text(
-        "👋 Привет! Я бот отчётов Kaspi магазина.\nВыберите что показать:",
+        "👋 Привет! Я показываю сколько заказов передано на доставку.\nВыберите период:",
         reply_markup=KEYBOARD,
     )
 
@@ -142,10 +129,14 @@ async def cmd_start(update, context):
 async def cmd_today(update, context):
     await update.message.reply_text("⏳ Загружаю данные...")
     try:
-        start, end = await get_today_range()
-        orders = await get_orders(start, end)
-        stats = analyze_orders(orders)
-        await update.message.reply_text(format_daily(stats), parse_mode="Markdown", reply_markup=KEYBOARD)
+        start, end = day_range()
+        orders = await get_orders_by_status(DELIVERY_STATUSES, start, end)
+        stats = analyze(orders)
+        today_str = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
+        await update.message.reply_text(
+            format_report(stats, "📊", today_str),
+            parse_mode="Markdown", reply_markup=KEYBOARD
+        )
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=KEYBOARD)
 
@@ -157,9 +148,13 @@ async def cmd_week(update, context):
         week_start = now - timedelta(days=now.weekday())
         start = TIMEZONE.localize(datetime(week_start.year, week_start.month, week_start.day, 0, 0, 0))
         end = TIMEZONE.localize(datetime(now.year, now.month, now.day, 23, 59, 59))
-        orders = await get_orders(start, end)
-        stats = analyze_orders(orders)
-        await update.message.reply_text(format_weekly(stats, week_start, now), parse_mode="Markdown", reply_markup=KEYBOARD)
+        orders = await get_orders_by_status(DELIVERY_STATUSES, start, end)
+        stats = analyze(orders)
+        period = f"{week_start.strftime('%d.%m')} — {now.strftime('%d.%m.%Y')}"
+        await update.message.reply_text(
+            format_report(stats, "📅", period),
+            parse_mode="Markdown", reply_markup=KEYBOARD
+        )
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=KEYBOARD)
 
@@ -172,24 +167,24 @@ async def cmd_month(update, context):
         end = TIMEZONE.localize(datetime(now.year, now.month, now.day, 23, 59, 59))
         month_names = {1:"Январь",2:"Февраль",3:"Март",4:"Апрель",5:"Май",6:"Июнь",
                        7:"Июль",8:"Август",9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"}
-        orders = await get_orders(start, end)
-        stats = analyze_orders(orders)
-        stats['days'] = now.day
-        await update.message.reply_text(format_monthly(stats, month_names[now.month], now.year), parse_mode="Markdown", reply_markup=KEYBOARD)
+        orders = await get_orders_by_status(DELIVERY_STATUSES, start, end)
+        stats = analyze(orders)
+        period = f"{month_names[now.month]} {now.year}"
+        await update.message.reply_text(
+            format_report(stats, "🗓", period),
+            parse_mode="Markdown", reply_markup=KEYBOARD
+        )
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=KEYBOARD)
 
 
 async def cmd_help(update, context):
     await update.message.reply_text(
-        "📋 *Команды бота:*\n\n"
-        "📊 *Сегодня* — заказы за сегодня\n"
-        "📅 *Неделя* — заказы с начала недели\n"
-        "🗓 *Месяц* — заказы с начала месяца\n\n"
-        "⏰ *Автоматические отчёты:*\n"
-        "• Каждый день в 20:00\n"
-        "• Каждый понедельник в 09:00\n"
-        "• 1-го числа каждого месяца в 09:00",
+        "📋 *Бот считает заказы переданные на доставку*\n\n"
+        "📊 *Сегодня* — сколько передали сегодня\n"
+        "📅 *Неделя* — с начала этой недели\n"
+        "🗓 *Месяц* — с начала этого месяца\n\n"
+        "⏰ Автоотчёт приходит каждый день в *20:00*",
         parse_mode="Markdown", reply_markup=KEYBOARD,
     )
 
@@ -206,25 +201,27 @@ async def handle_message(update, context):
         await cmd_help(update, context)
 
 
-# === АВТООТЧЁТЫ ===
 async def auto_daily(app):
     try:
-        start, end = await get_today_range()
-        orders = await get_orders(start, end)
-        stats = analyze_orders(orders)
-        await app.bot.send_message(chat_id=CHAT_ID, text=format_daily(stats), parse_mode="Markdown")
+        start, end = day_range()
+        orders = await get_orders_by_status(DELIVERY_STATUSES, start, end)
+        stats = analyze(orders)
+        today_str = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
+        await app.bot.send_message(
+            chat_id=CHAT_ID,
+            text=format_report(stats, "📊 Ежедневный отчёт", today_str),
+            parse_mode="Markdown"
+        )
     except Exception as e:
         await app.bot.send_message(chat_id=CHAT_ID, text=f"❌ Ошибка авто-отчёта: {e}")
 
 
 async def post_init(app):
-    """Запускается после инициализации приложения"""
     await app.bot.send_message(
         chat_id=CHAT_ID,
-        text="✅ Бот запущен! Теперь можно запросить отчёт в любое время через кнопки.",
+        text="✅ Бот запущен! Отчёт каждый день в 20:00.\nНажмите кнопку чтобы посмотреть сейчас:",
         reply_markup=KEYBOARD,
     )
-
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
     scheduler.add_job(auto_daily, "cron", hour=20, minute=0, args=[app])
     scheduler.start()
@@ -232,14 +229,12 @@ async def post_init(app):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("month", cmd_month))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     app.run_polling(drop_pending_updates=True)
 
 
